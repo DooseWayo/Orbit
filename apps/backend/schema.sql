@@ -69,6 +69,27 @@ CREATE TABLE billing_locks (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- 6. API Keys Table
+-- Merchant API credentials. Keys are formatted orb_<live|test>_<64 hex chars>; only
+-- the SHA-256 hex digest of the full key is stored, the secret itself is shown to the
+-- merchant once at creation. key_prefix (e.g. orb_live_71c2) identifies a key in the
+-- dashboard without revealing it. A key is active while revoked_at IS NULL.
+CREATE TABLE api_keys (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    key_prefix VARCHAR(16) NOT NULL,
+    key_hash VARCHAR(64) NOT NULL CHECK (key_hash ~ '^[0-9a-f]{64}$'),
+    environment VARCHAR(20) NOT NULL CHECK (environment IN ('live', 'test')),
+    last_used_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    revoked_at TIMESTAMP WITH TIME ZONE
+);
+
+-- Authentication looks keys up by hash; hashes of random 256-bit secrets never collide
+CREATE UNIQUE INDEX api_keys_key_hash_idx ON api_keys (key_hash);
+CREATE INDEX api_keys_merchant_id_idx ON api_keys (merchant_id);
+
 -- Atomically claims an idempotency key. Returns {"claimed": true, "record": ...}
 -- when the caller now owns the key and must execute the request, or
 -- {"claimed": false, "record": ...} with the existing record otherwise.
@@ -204,6 +225,7 @@ ALTER TABLE plans ENABLE ROW LEVEL SECURITY;
 ALTER TABLE subscriptions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE idempotency_keys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE billing_locks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY;
 
 -- Public checkout read access for plans and merchant public identifiers
 CREATE POLICY "Allow public read access to merchants for checkout"
@@ -214,6 +236,6 @@ CREATE POLICY "Allow public read access to plans for checkout"
     ON plans FOR SELECT
     USING (true);
 
--- No public policies for subscriptions, idempotency_keys or billing_locks:
+-- No public policies for subscriptions, idempotency_keys, billing_locks or api_keys:
 -- default-deny prevents anon key access.
 -- No open INSERT or UPDATE policies: all mutations require backend service role.

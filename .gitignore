@@ -4,8 +4,6 @@ node_modules/
 .pnp.js
 
 # Environment Variables (Security)
-.env
-.env.*
 !.env.example
 *.pem
 
@@ -30,7 +28,7 @@ scratch-test/
 # Editor / OS files
 .DS_Store
 Thumbs.db
-.vscode/
 .idea/
 *.log
 *.swp
+config.bat

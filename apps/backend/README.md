@@ -23,6 +23,10 @@ Copy `apps/backend/.env.example` to `apps/backend/.env` and configure:
 | `IDEMPOTENCY_KEY_TTL_SECONDS` | How long an `Idempotency-Key` replays its stored response (defaults to 24h) | `86400` |
 | `IDEMPOTENCY_IN_PROGRESS_TIMEOUT_SECONDS` | After this long an unfinished claim is treated as abandoned and may be retried (defaults to 300) | `300` |
 | `PREPARE_LOCK_TTL_SECONDS` | Billing lease held while `/trigger-pull` simulates a pull (defaults to 60) | `60` |
+| `RATE_LIMIT_WINDOW_MS` | Sliding window length for both rate limits (defaults to 60000) | `60000` |
+| `API_KEY_RATE_LIMIT_MAX` | Requests per window allowed for each API key on authenticated routes (defaults to 100) | `100` |
+| `IP_RATE_LIMIT_MAX` | Requests per window allowed for each client IP on every route (defaults to 300) | `300` |
+| `TRUST_PROXY` | Express `trust proxy` setting; set when behind a load balancer so rate limiting sees the client IP | `1` |
 
 ### Running the API
 
@@ -38,14 +42,69 @@ The service runs at `http://localhost:3001`.
 
 ## API Routes Overview
 
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/plans` | Create a new recurring pricing plan |
-| `GET` | `/plans/:id` | Fetch plan and merchant details |
-| `GET` | `/subscribers` | List active subscribers for a merchant |
-| `POST` | `/trigger-pull` | Prepare an unsigned merchant pull transaction |
-| `POST` | `/submit-pull` | Verify and submit a wallet-signed pull transaction |
-| `POST` | `/subscriptions` | Record a customer subscription after handshake |
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `POST` | `/plans` | API key | Create a new recurring pricing plan |
+| `GET` | `/plans/:id` | Public | Fetch plan and merchant details |
+| `GET` | `/subscribers` | API key | List active subscribers for a merchant |
+| `POST` | `/trigger-pull` | API key | Prepare an unsigned merchant pull transaction |
+| `POST` | `/submit-pull` | API key | Verify and submit a wallet-signed pull transaction |
+| `POST` | `/subscriptions` | Public | Record a customer subscription after handshake |
+| `POST` | `/api-keys` | API key | Create an API key (secret shown once) |
+| `GET` | `/api-keys` | API key | List the merchant's API keys |
+| `DELETE` | `/api-keys/:id` | API key | Revoke an API key |
+
+---
+
+## Authentication
+
+Merchant routes require an API key in the `Authorization` header:
+
+```bash
+curl http://localhost:3001/subscribers -H "Authorization: Bearer orb_live_<64 hex chars>"
+```
+
+- Keys look like `orb_live_<32 random bytes as hex>` or `orb_test_<...>`.
+- Only the SHA-256 hash of a key is stored (`api_keys.key_hash`), together with a short `key_prefix` such as `orb_live_71c2` used to identify the key in the dashboard. The full secret is returned once, when the key is created, and cannot be recovered.
+- The authenticated merchant is derived from the key. `merchant_id` in request bodies and query strings is now optional; if sent it must match the key's merchant, otherwise the request is rejected with `403 Forbidden`. `/trigger-pull` and `/submit-pull` return `404` for subscriptions owned by another merchant.
+- A missing, malformed, unknown or revoked key returns `401 Unauthorized` with a `WWW-Authenticate: Bearer` header.
+- `last_used_at` is updated at most once a minute per key.
+
+The checkout routes (`GET /plans/:id`, `POST /subscriptions`) stay public.
+
+### Issuing keys
+
+Bootstrap a merchant's first key directly against the database (requires the Supabase env vars):
+
+```bash
+npm run create-api-key -- <merchant_id> "Server key" live
+```
+
+Further keys can be managed over the API with an existing key:
+
+```bash
+# Create (environment: "live" or "test"). A test key cannot create a live key.
+curl -X POST http://localhost:3001/api-keys \
+  -H "Authorization: Bearer $ORBIT_API_KEY" -H "Content-Type: application/json" \
+  -d '{"name": "CI", "environment": "test"}'
+
+# List (never includes secrets or hashes)
+curl http://localhost:3001/api-keys -H "Authorization: Bearer $ORBIT_API_KEY"
+
+# Revoke
+curl -X DELETE http://localhost:3001/api-keys/<key id> -H "Authorization: Bearer $ORBIT_API_KEY"
+```
+
+`POST /api-keys` deliberately does not support `Idempotency-Key`, since replaying the response would require persisting the secret.
+
+### Rate limiting
+
+Two in-memory sliding-window limits apply (default window 60 seconds):
+
+- **Per client IP** on every route, including public ones and failed authentication attempts (`IP_RATE_LIMIT_MAX`, default 300).
+- **Per API key** on authenticated routes (`API_KEY_RATE_LIMIT_MAX`, default 100).
+
+Responses carry `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset` (seconds until the oldest counted request leaves the window) and `RateLimit-Policy`. Over the limit the API returns `429 Too Many Requests` with `Retry-After`. Counters are per process; with several API instances behind a load balancer each enforces its own limit.
 
 ---
 
@@ -61,7 +120,7 @@ Content-Type: `application/json`
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `merchant_id` | `string` (UUID) | Yes | Unique ID of the merchant creating the plan (must exist in `merchants` table). |
+| `merchant_id` | `string` (UUID) | No | Taken from the API key. If sent, must match the authenticated merchant (`403` otherwise). |
 | `name` | `string` | Yes | Name of the subscription plan (e.g., `"Pro Plan - 29 USDC/month"`). |
 | `usdc_amount` | `integer` | Yes | Billing amount per interval in raw token units. USDC has 7 decimals, so `290000000` is 29 USDC. This is the same unit as the contract's `amount_per_interval`. |
 | `interval_seconds` | `number` | Yes | Cadence between billing pulls in seconds (e.g., `2592000` for 30 days). |
@@ -70,9 +129,9 @@ Content-Type: `application/json`
 
 ```bash
 curl -X POST http://localhost:3001/plans \
+  -H "Authorization: Bearer $ORBIT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "merchant_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
     "name": "Pro Plan - 29 USDC/month",
     "usdc_amount": 290000000,
     "interval_seconds": 2592000
@@ -176,18 +235,18 @@ Status: `200 OK`
 ### 3. GET /subscribers
 
 #### Purpose
-Fetches all active subscriptions across plans owned by a specific merchant, used by the merchant dashboard.
+Fetches all active subscriptions across plans owned by the authenticated merchant, used by the merchant dashboard.
 
 #### Query Parameters
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `merchant_id` | `string` (UUID) | Yes | Unique ID of the merchant whose subscribers are queried. |
+| `merchant_id` | `string` (UUID) | No | Taken from the API key. If sent, must match the authenticated merchant (`403` otherwise). |
 
 #### Example Request
 
 ```bash
-curl "http://localhost:3001/subscribers?merchant_id=9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
+curl http://localhost:3001/subscribers -H "Authorization: Bearer $ORBIT_API_KEY"
 ```
 
 #### Example Success Response
@@ -216,12 +275,10 @@ Status: `200 OK`
 #### Error Responses
 
 - `400 Bad Request`
-  Returned when the `merchant_id` query parameter is missing.
-  ```json
-  {
-    "error": "Missing merchant_id query parameter"
-  }
-  ```
+  Returned when `merchant_id` is not a valid UUID.
+
+- `403 Forbidden`
+  Returned when `merchant_id` names a different merchant than the API key.
 
 - `500 Internal Server Error`
   Returned if the database query fails.
@@ -256,6 +313,7 @@ Content-Type: `application/json`
 
 ```bash
 curl -X POST http://localhost:3001/trigger-pull \
+  -H "Authorization: Bearer $ORBIT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "subscription_id": "c1f7b9e0-1234-5678-9abc-def012345678"
@@ -422,8 +480,9 @@ The API queries the tables defined in `apps/backend/schema.sql`:
 - `subscriptions`: `id` (UUID PK), `plan_id` (UUID FK -> `plans.id`), `customer_wallet_address` (VARCHAR), `status` (VARCHAR DEFAULT 'active'), `next_billing_date` (TIMESTAMP), `created_at` (TIMESTAMP).
 - `idempotency_keys`: `id` (UUID PK), `key` (VARCHAR), `merchant_id` (UUID FK -> `merchants.id`, cascade), `request_path` (VARCHAR), `request_hash` (VARCHAR(64)), `status` (`in_progress` / `completed` / `failed`), `response_code` (INTEGER), `response_body` (JSONB), `created_at`, `updated_at`, `expires_at` (TIMESTAMP). Unique on `(merchant_id, key)`.
 - `billing_locks`: `subscription_id` (UUID PK, FK -> `subscriptions.id`), `lock_token` (UUID), `locked_until` (TIMESTAMP), `created_at` (TIMESTAMP).
+- `api_keys`: `id` (UUID PK), `merchant_id` (UUID FK -> `merchants.id`, cascade), `name` (VARCHAR), `key_prefix` (VARCHAR(16)), `key_hash` (VARCHAR(64), unique SHA-256 hex), `environment` (`live` / `test`), `last_used_at`, `created_at`, `revoked_at` (TIMESTAMP). Active while `revoked_at` is null.
 
-Existing databases can apply the new section of `schema.sql` (tables 4 and 5, their functions, `REVOKE`s and RLS statements) as a migration.
+Existing databases can apply the new sections of `schema.sql` (tables 4, 5 and 6, their functions, indexes, `REVOKE`s and RLS statements) as a migration.
 
 ### Row Level Security (RLS) Policy Model
 
@@ -432,7 +491,7 @@ Row Level Security is enabled on all tables in `schema.sql` with a locked-down p
 1. **Backend Service Role**: The backend Express API connects with `SUPABASE_SERVICE_ROLE_KEY`. The Postgres service role possesses the `BYPASSRLS` privilege, granting the backend full authority to execute queries, create plans, record subscriptions, and advance billing schedules.
 2. **Public Anon Access (Checkout Flow)**: Direct access via the public Supabase anon key is restricted to `SELECT` on `plans` and `merchants`. This allows unauthenticated checkout widgets and client browsers to inspect plan details and the merchant's recipient address.
 3. **No Public Mutations**: Open `INSERT` and `UPDATE` policies have been removed from all tables. Clients cannot directly inject plans, alter subscriptions, or create unauthorized merchant accounts with the anon key.
-4. **Subscription Confidentiality**: The `subscriptions`, `idempotency_keys` and `billing_locks` tables have **no** policies granted to public/anon roles. Postgres default-deny prevents unauthenticated or client-side anon requests from querying subscriber lists or viewing competitor customer accounts.
+4. **Subscription Confidentiality**: The `subscriptions`, `idempotency_keys`, `billing_locks` and `api_keys` tables have **no** policies granted to public/anon roles. Postgres default-deny prevents unauthenticated or client-side anon requests from querying subscriber lists or viewing competitor customer accounts.
 
 ---
 

@@ -5,9 +5,32 @@ const { createClient } = require('@supabase/supabase-js');
 const { z } = require('zod');
 const { StrKey, Keypair, rpc, Networks, TransactionBuilder, Contract, Address } = require('@stellar/stellar-sdk');
 const { executeIdempotently, withBillingLock, sendResult } = require('./idempotency');
+const { API_KEY_ENVIRONMENTS, issueApiKey, requireApiKey } = require('./apiKeys');
+const { createRateLimiter } = require('./rateLimit');
 
 const app = express();
+// Set when running behind a reverse proxy so req.ip (used for rate limiting) is the client's address
+if (process.env.TRUST_PROXY) app.set('trust proxy', process.env.TRUST_PROXY);
 app.use(cors());
+
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS) || 60 * 1000;
+// Coarse per-IP limit on every route, public or not, so unauthenticated traffic
+// (including floods of invalid API keys) cannot exhaust the database
+const ipRateLimit = createRateLimiter({
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    limit: Number(process.env.IP_RATE_LIMIT_MAX) || 300,
+    keyGenerator: (req) => req.ip,
+});
+// Per-API-key limit on authenticated merchant routes
+const apiKeyRateLimit = createRateLimiter({
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    limit: Number(process.env.API_KEY_RATE_LIMIT_MAX) || 100,
+    keyGenerator: (req) => req.apiKey?.id,
+    message: "API key rate limit exceeded, please retry later",
+});
+app.locals.rateLimiters = { ip: ipRateLimit, apiKey: apiKeyRateLimit };
+
+app.use(ipRateLimit);
 app.use(express.json());
 
 // Initialize Supabase Client
@@ -19,6 +42,9 @@ if (supabaseUrl && supabaseKey) {
 }
 
 const getSupabase = () => app.locals.supabase || defaultSupabase;
+
+// Merchant routes: authenticate the API key, then apply its rate limit
+const authenticateMerchant = [requireApiKey(getSupabase), apiKeyRateLimit];
 
 // Allows tests to inject a mock Soroban RPC server instead of hitting testnet
 const getSorobanServer = (rpcUrl) => app.locals.sorobanServer || new rpc.Server(rpcUrl);
@@ -56,8 +82,11 @@ const stellarAddressSchema = z.string().refine(
     { message: "must be a valid Stellar Ed25519 public address" }
 );
 
+// merchant_id is taken from the API key; a client-supplied value is only checked against it
+const optionalMerchantIdSchema = z.string().uuid("merchant_id must be a valid UUID").optional();
+
 const createPlanSchema = z.object({
-    merchant_id: z.string().uuid("merchant_id must be a valid UUID"),
+    merchant_id: optionalMerchantIdSchema,
     name: z.string().trim().min(1, "name cannot be empty"),
     // Raw token units (USDC has 7 decimals, so 290000000 = 29 USDC), same as the contract's amount_per_interval
     usdc_amount: z.coerce.number()
@@ -71,7 +100,7 @@ const getPlanParamsSchema = z.object({
 });
 
 const getSubscribersQuerySchema = z.object({
-    merchant_id: z.string().uuid("merchant_id must be a valid UUID"),
+    merchant_id: optionalMerchantIdSchema,
 });
 
 const createSubscriptionSchema = z.object({
@@ -88,6 +117,15 @@ const submitPullSchema = z.object({
     signed_xdr: z.string().min(1, "signed_xdr is required"),
 }).strict();
 
+const createApiKeySchema = z.object({
+    name: z.string().trim().min(1, "name cannot be empty").max(255, "name must be at most 255 characters"),
+    environment: z.enum(API_KEY_ENVIRONMENTS, { message: "environment must be 'live' or 'test'" }),
+}).strict();
+
+const apiKeyParamsSchema = z.object({
+    id: z.string().uuid("id parameter must be a valid UUID"),
+});
+
 // PostgREST reports a .single() lookup that matched no rows as an error, not as empty data
 const isNoRowsError = (error) => error?.code === 'PGRST116';
 
@@ -103,16 +141,24 @@ const formatZodError = (err) => {
     return `Invalid input on ${field}: ${issue.message}`;
 };
 
+// Rejects a client-supplied merchant_id that names a merchant other than the authenticated one
+const merchantMismatch = (req, merchantId) =>
+    merchantId !== undefined && merchantId !== req.merchant.id;
+
+const MERCHANT_MISMATCH_ERROR = { error: "merchant_id does not match the authenticated API key" };
+
 // ==========================================
 // ROUTE 1: POST /plans (Create a new pricing plan)
 // ==========================================
-app.post('/plans', async (req, res) => {
+app.post('/plans', authenticateMerchant, async (req, res) => {
     const parseResult = createPlanSchema.safeParse(req.body);
     if (!parseResult.success) {
         return res.status(400).json({ error: formatZodError(parseResult.error) });
     }
+    if (merchantMismatch(req, parseResult.data.merchant_id)) return res.status(403).json(MERCHANT_MISMATCH_ERROR);
 
-    const { merchant_id, name, usdc_amount, interval_seconds } = parseResult.data;
+    const { name, usdc_amount, interval_seconds } = parseResult.data;
+    const merchant_id = req.merchant.id;
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
 
@@ -170,14 +216,15 @@ app.get('/plans/:id', async (req, res) => {
 // ==========================================
 // ROUTE 3: GET /subscribers (Fetch active subscribers for dashboard)
 // ==========================================
-app.get('/subscribers', async (req, res) => {
+app.get('/subscribers', authenticateMerchant, async (req, res) => {
     const parseResult = getSubscribersQuerySchema.safeParse(req.query);
     if (!parseResult.success) {
         return res.status(400).json({ error: formatZodError(parseResult.error) });
     }
+    if (merchantMismatch(req, parseResult.data.merchant_id)) return res.status(403).json(MERCHANT_MISMATCH_ERROR);
 
     try {
-        const { merchant_id } = parseResult.data;
+        const merchant_id = req.merchant.id;
         const supabase = getSupabase();
         if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
 
@@ -202,7 +249,9 @@ app.get('/subscribers', async (req, res) => {
 // ==========================================
 // ROUTE 4: POST /trigger-pull (The Blockchain Bridge)
 // ==========================================
-const loadPullContext = async (supabase, subscriptionId) => {
+// Loads a subscription owned by the authenticated merchant. Another merchant's
+// subscription is reported as not found so its existence is not revealed.
+const loadPullContext = async (supabase, subscriptionId, merchant) => {
     const { data: sub, error: subError } = await supabase
         .from('subscriptions')
         .select(`
@@ -214,19 +263,12 @@ const loadPullContext = async (supabase, subscriptionId) => {
 
     if (isNoRowsError(subError) || !sub) return { status: 404, error: "Subscription not found" };
     if (subError) throw subError;
+    if (sub.plans?.merchant_id !== merchant.id) return { status: 404, error: "Subscription not found" };
 
-    const { data: merchant, error: merchantError } = await supabase
-        .from('merchants')
-        .select('wallet_address')
-        .eq('id', sub.plans.merchant_id)
-        .single();
-
-    if (isNoRowsError(merchantError) || !merchant) return { status: 404, error: "Merchant not found" };
-    if (merchantError) throw merchantError;
     return { sub, merchant };
 };
 
-app.post('/trigger-pull', async (req, res) => {
+app.post('/trigger-pull', authenticateMerchant, async (req, res) => {
     const parseResult = triggerPullSchema.safeParse(req.body);
     if (!parseResult.success) {
         return res.status(400).json({ error: formatZodError(parseResult.error) });
@@ -237,7 +279,7 @@ app.post('/trigger-pull', async (req, res) => {
         const supabase = getSupabase();
         if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
 
-        const context = await loadPullContext(supabase, subscription_id);
+        const context = await loadPullContext(supabase, subscription_id, req.merchant);
         if (context.error) return res.status(context.status).json({ error: context.error });
         const { sub, merchant } = context;
 
@@ -294,7 +336,7 @@ app.post('/trigger-pull', async (req, res) => {
 });
 
 // Accept only a wallet-signed envelope, verify the merchant signature, then submit it.
-app.post('/submit-pull', async (req, res) => {
+app.post('/submit-pull', authenticateMerchant, async (req, res) => {
     const parseResult = submitPullSchema.safeParse(req.body);
     if (!parseResult.success) return res.status(400).json({ error: formatZodError(parseResult.error) });
 
@@ -302,7 +344,7 @@ app.post('/submit-pull', async (req, res) => {
         const { subscription_id, signed_xdr } = parseResult.data;
         const supabase = getSupabase();
         if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
-        const context = await loadPullContext(supabase, subscription_id);
+        const context = await loadPullContext(supabase, subscription_id, req.merchant);
         if (context.error) return res.status(context.status).json({ error: context.error });
         const { sub, merchant } = context;
 
@@ -454,6 +496,93 @@ app.post('/subscriptions', async (req, res) => {
         return { status: 201, body: { message: "Subscription created", subscription: data } };
     });
     sendResult(res, result);
+});
+
+// ==========================================
+// ROUTE 6: API key management (authenticated with an existing key)
+// ==========================================
+// The first key for a merchant is issued out of band with `npm run create-api-key`.
+
+const API_KEY_COLUMNS = 'id, name, key_prefix, environment, created_at, last_used_at, revoked_at';
+
+// Not wrapped in executeIdempotently: that would persist the one-time secret in idempotency_keys
+app.post('/api-keys', authenticateMerchant, async (req, res) => {
+    const parseResult = createApiKeySchema.safeParse(req.body);
+    if (!parseResult.success) {
+        return res.status(400).json({ error: formatZodError(parseResult.error) });
+    }
+
+    const { name, environment } = parseResult.data;
+    // A test key must not be able to escalate itself into live credentials
+    if (environment === 'live' && req.apiKey.environment !== 'live') {
+        return res.status(403).json({ error: "Live API keys can only be created with a live API key" });
+    }
+
+    try {
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const { apiKey, secret, error } = await issueApiKey(supabase, { merchantId: req.merchant.id, name, environment });
+        if (error) throw error;
+
+        res.set('Cache-Control', 'no-store');
+        res.status(201).json({
+            message: "API key created. Store the secret now; it will not be shown again.",
+            api_key: apiKey,
+            secret,
+        });
+    } catch (err) {
+        console.error("Error creating API key:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api-keys', authenticateMerchant, async (req, res) => {
+    try {
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const { data, error } = await supabase
+            .from('api_keys')
+            .select(API_KEY_COLUMNS)
+            .eq('merchant_id', req.merchant.id)
+            .order('created_at', { ascending: false });
+        if (error) throw error;
+
+        res.status(200).json({ api_keys: data });
+    } catch (err) {
+        console.error("Error listing API keys:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete('/api-keys/:id', authenticateMerchant, async (req, res) => {
+    const parseResult = apiKeyParamsSchema.safeParse(req.params);
+    if (!parseResult.success) {
+        return res.status(400).json({ error: formatZodError(parseResult.error) });
+    }
+
+    try {
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        // Scoped by merchant_id so one merchant can never revoke another's key
+        const { data, error } = await supabase
+            .from('api_keys')
+            .update({ revoked_at: new Date().toISOString() })
+            .eq('id', parseResult.data.id)
+            .eq('merchant_id', req.merchant.id)
+            .is('revoked_at', null)
+            .select(API_KEY_COLUMNS)
+            .maybeSingle();
+        if (error) throw error;
+        if (!data) return res.status(404).json({ error: "API key not found or already revoked" });
+
+        res.status(200).json({ message: "API key revoked", api_key: data });
+    } catch (err) {
+        console.error("Error revoking API key:", err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 const PORT = process.env.PORT || 3001;

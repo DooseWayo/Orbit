@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import request from 'supertest';
 import { Keypair, StrKey, Account, Networks, TransactionBuilder } from '@stellar/stellar-sdk';
 import app from '../index.js';
+import { makeApiKey } from './helpers.js';
 import { hashRequestBody } from '../idempotency.js';
 
 describe('Idempotency keys and billing locks', () => {
@@ -19,6 +20,7 @@ describe('Idempotency keys and billing locks', () => {
   };
 
   let mockSupabase;
+  let apiKey;
   let rpcHandlers;
 
   const claimResult = (claimed, record = {}) => ({
@@ -52,7 +54,13 @@ describe('Idempotency keys and billing locks', () => {
       rpc: vi.fn(async (fn, args) => rpcHandlers[fn](args)),
     };
 
+    apiKey = makeApiKey({ merchantId: validMerchantId, walletAddress: validStellarAddress });
+    // API key lookup performed by the auth middleware
+    mockSupabase.maybeSingle = vi.fn().mockResolvedValue({ data: apiKey.row, error: null });
+
     app.locals.supabase = mockSupabase;
+    app.locals.rateLimiters.ip.reset();
+    app.locals.rateLimiters.apiKey.reset();
   });
 
   describe('request hashing', () => {
@@ -67,7 +75,7 @@ describe('Idempotency keys and billing locks', () => {
 
   describe('POST /plans with Idempotency-Key', () => {
     it('runs the request once and stores the response as completed', async () => {
-      const res = await request(app).post('/plans').set('Idempotency-Key', 'key-1').send(planBody);
+      const res = await request(app).post('/plans').set('Authorization', apiKey.header).set('Idempotency-Key', 'key-1').send(planBody);
 
       expect(res.status).toBe(201);
       expect(res.headers['idempotent-replayed']).toBeUndefined();
@@ -92,7 +100,7 @@ describe('Idempotency keys and billing locks', () => {
         response_body: { message: 'Plan created successfully', plan: { id: validPlanId } },
       });
 
-      const res = await request(app).post('/plans').set('Idempotency-Key', 'key-1').send(planBody);
+      const res = await request(app).post('/plans').set('Authorization', apiKey.header).set('Idempotency-Key', 'key-1').send(planBody);
 
       expect(res.status).toBe(201);
       expect(res.body.plan.id).toBe(validPlanId);
@@ -108,7 +116,7 @@ describe('Idempotency keys and billing locks', () => {
         request_hash: hashRequestBody(planBody),
       });
 
-      const res = await request(app).post('/plans').set('Idempotency-Key', 'key-1').send(planBody);
+      const res = await request(app).post('/plans').set('Authorization', apiKey.header).set('Idempotency-Key', 'key-1').send(planBody);
 
       expect(res.status).toBe(409);
       expect(res.headers['retry-after']).toBe('1');
@@ -124,7 +132,7 @@ describe('Idempotency keys and billing locks', () => {
         response_body: {},
       });
 
-      const res = await request(app).post('/plans').set('Idempotency-Key', 'key-1').send(planBody);
+      const res = await request(app).post('/plans').set('Authorization', apiKey.header).set('Idempotency-Key', 'key-1').send(planBody);
 
       expect(res.status).toBe(422);
       expect(mockSupabase.insert).not.toHaveBeenCalled();
@@ -139,13 +147,13 @@ describe('Idempotency keys and billing locks', () => {
         response_body: {},
       });
 
-      const res = await request(app).post('/plans').set('Idempotency-Key', 'key-1').send(planBody);
+      const res = await request(app).post('/plans').set('Authorization', apiKey.header).set('Idempotency-Key', 'key-1').send(planBody);
 
       expect(res.status).toBe(422);
     });
 
     it('rejects an over-long key with 400', async () => {
-      const res = await request(app).post('/plans').set('Idempotency-Key', 'k'.repeat(256)).send(planBody);
+      const res = await request(app).post('/plans').set('Authorization', apiKey.header).set('Idempotency-Key', 'k'.repeat(256)).send(planBody);
 
       expect(res.status).toBe(400);
       expect(res.body.error).toContain('Idempotency-Key');
@@ -158,7 +166,7 @@ describe('Idempotency keys and billing locks', () => {
         error: { code: '57014', message: 'canceling statement due to statement timeout' },
       });
 
-      const res = await request(app).post('/plans').set('Idempotency-Key', 'key-1').send(planBody);
+      const res = await request(app).post('/plans').set('Authorization', apiKey.header).set('Idempotency-Key', 'key-1').send(planBody);
 
       expect(res.status).toBe(500);
       expect(finalizeCall()).toMatchObject({ status: 'failed', response_code: 500 });
@@ -170,7 +178,7 @@ describe('Idempotency keys and billing locks', () => {
         error: { code: '23503', message: 'violates foreign key constraint' },
       });
 
-      const res = await request(app).post('/plans').set('Idempotency-Key', 'key-1').send(planBody);
+      const res = await request(app).post('/plans').set('Authorization', apiKey.header).set('Idempotency-Key', 'key-1').send(planBody);
 
       expect(res.status).toBe(404);
       expect(res.body.error).toBe('Merchant not found');
@@ -178,7 +186,7 @@ describe('Idempotency keys and billing locks', () => {
     });
 
     it('does not touch idempotency storage when no key is sent', async () => {
-      const res = await request(app).post('/plans').send(planBody);
+      const res = await request(app).post('/plans').set('Authorization', apiKey.header).send(planBody);
 
       expect(res.status).toBe(201);
       expect(mockSupabase.rpc).not.toHaveBeenCalled();
@@ -234,19 +242,16 @@ describe('Idempotency keys and billing locks', () => {
       app.locals.txPollIntervalMs = 1;
       app.locals.txPollTimeoutMs = 20;
 
-      mockSupabase.single.mockImplementation(() => {
-        if (mockSupabase.single.mock.calls.length % 2 === 1) {
-          return Promise.resolve({
-            data: {
-              id: validSubscriptionId,
-              customer_wallet_address: validStellarAddress,
-              plans: { merchant_id: validMerchantId, usdc_amount: 290000000, interval_seconds: 2592000 },
-            },
-            error: null,
-          });
-        }
-        return Promise.resolve({ data: { wallet_address: merchantKeypair.publicKey() }, error: null });
+      mockSupabase.single.mockResolvedValue({
+        data: {
+          id: validSubscriptionId,
+          customer_wallet_address: validStellarAddress,
+          plans: { merchant_id: validMerchantId, usdc_amount: 290000000, interval_seconds: 2592000 },
+        },
+        error: null,
       });
+      // The merchant wallet comes from the authenticated API key
+      apiKey.row.merchants.wallet_address = merchantKeypair.publicKey();
 
       mockServer = {
         getAccount: vi.fn().mockResolvedValue(new Account(merchantKeypair.publicKey(), '1')),
@@ -267,7 +272,7 @@ describe('Idempotency keys and billing locks', () => {
     const rpcCalls = (fn) => mockSupabase.rpc.mock.calls.filter(([name]) => name === fn);
 
     const signedPull = async () => {
-      const prepared = await request(app).post('/trigger-pull').send({ subscription_id: validSubscriptionId });
+      const prepared = await request(app).post('/trigger-pull').set('Authorization', apiKey.header).send({ subscription_id: validSubscriptionId });
       const tx = TransactionBuilder.fromXDR(prepared.body.transaction_xdr, Networks.TESTNET);
       tx.sign(merchantKeypair);
       mockSupabase.rpc.mockClear();
@@ -275,7 +280,7 @@ describe('Idempotency keys and billing locks', () => {
     };
 
     it('acquires and releases the lock around preparing a pull', async () => {
-      const res = await request(app).post('/trigger-pull').send({ subscription_id: validSubscriptionId });
+      const res = await request(app).post('/trigger-pull').set('Authorization', apiKey.header).send({ subscription_id: validSubscriptionId });
 
       expect(res.status).toBe(200);
       const [[, acquireArgs]] = rpcCalls('acquire_billing_lock');
@@ -287,7 +292,7 @@ describe('Idempotency keys and billing locks', () => {
     it('returns 409 and skips simulation when another billing operation holds the lock', async () => {
       rpcHandlers.acquire_billing_lock = () => ({ data: false, error: null });
 
-      const res = await request(app).post('/trigger-pull').send({ subscription_id: validSubscriptionId });
+      const res = await request(app).post('/trigger-pull').set('Authorization', apiKey.header).send({ subscription_id: validSubscriptionId });
 
       expect(res.status).toBe(409);
       expect(res.headers['retry-after']).toBe('5');
@@ -301,6 +306,7 @@ describe('Idempotency keys and billing locks', () => {
 
       const res = await request(app)
         .post('/trigger-pull')
+        .set('Authorization', apiKey.header)
         .set('Idempotency-Key', 'pull-1')
         .send({ subscription_id: validSubscriptionId });
 
@@ -312,7 +318,7 @@ describe('Idempotency keys and billing locks', () => {
       const signed_xdr = await signedPull();
       rpcHandlers.acquire_billing_lock = () => ({ data: false, error: null });
 
-      const res = await request(app).post('/submit-pull').send({ subscription_id: validSubscriptionId, signed_xdr });
+      const res = await request(app).post('/submit-pull').set('Authorization', apiKey.header).send({ subscription_id: validSubscriptionId, signed_xdr });
 
       expect(res.status).toBe(409);
       expect(mockServer.sendTransaction).not.toHaveBeenCalled();
@@ -322,7 +328,7 @@ describe('Idempotency keys and billing locks', () => {
       mockServer.getTransaction.mockResolvedValue({ status: 'SUCCESS' });
       const signed_xdr = await signedPull();
 
-      const res = await request(app).post('/submit-pull').send({ subscription_id: validSubscriptionId, signed_xdr });
+      const res = await request(app).post('/submit-pull').set('Authorization', apiKey.header).send({ subscription_id: validSubscriptionId, signed_xdr });
 
       expect(res.status).toBe(200);
       expect(rpcCalls('acquire_billing_lock')).toHaveLength(1);
@@ -333,7 +339,7 @@ describe('Idempotency keys and billing locks', () => {
       mockServer.sendTransaction.mockResolvedValue({ status: 'ERROR', hash: 'deadbeef' });
       const signed_xdr = await signedPull();
 
-      const res = await request(app).post('/submit-pull').send({ subscription_id: validSubscriptionId, signed_xdr });
+      const res = await request(app).post('/submit-pull').set('Authorization', apiKey.header).send({ subscription_id: validSubscriptionId, signed_xdr });
 
       expect(res.status).toBe(500);
       expect(rpcCalls('release_billing_lock')).toHaveLength(1);
@@ -343,7 +349,7 @@ describe('Idempotency keys and billing locks', () => {
       mockServer.getTransaction.mockResolvedValue({ status: 'NOT_FOUND' });
       const signed_xdr = await signedPull();
 
-      const res = await request(app).post('/submit-pull').send({ subscription_id: validSubscriptionId, signed_xdr });
+      const res = await request(app).post('/submit-pull').set('Authorization', apiKey.header).send({ subscription_id: validSubscriptionId, signed_xdr });
 
       expect(res.status).toBe(202);
       expect(res.body.holdLock).toBeUndefined();
@@ -362,7 +368,7 @@ describe('Idempotency keys and billing locks', () => {
         response_body: { message: 'Successfully pulled funds on-chain!', txHash: 'deadbeef' },
       });
 
-      const res = await request(app).post('/submit-pull').set('Idempotency-Key', 'submit-1').send(body);
+      const res = await request(app).post('/submit-pull').set('Authorization', apiKey.header).set('Idempotency-Key', 'submit-1').send(body);
 
       expect(res.status).toBe(200);
       expect(res.body.txHash).toBe('deadbeef');

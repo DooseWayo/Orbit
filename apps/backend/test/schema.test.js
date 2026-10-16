@@ -53,4 +53,25 @@ describe('Database Schema & Row Level Security (RLS) Policies', () => {
       expect(schemaSql).toMatch(new RegExp(`REVOKE\\s+EXECUTE\\s+ON\\s+FUNCTION\\s+${fn}\\(`, 'i'));
     }
   });
+
+  it('defines api_keys storing only a SHA-256 hash of each key', () => {
+    const table = schemaSql.match(/CREATE\s+TABLE\s+api_keys\s*\(([\s\S]*?)\n\);/i)?.[1];
+    expect(table).toBeDefined();
+    expect(table).toMatch(/id\s+UUID\s+PRIMARY\s+KEY\s+DEFAULT\s+gen_random_uuid\(\)/i);
+    expect(table).toMatch(/merchant_id\s+UUID\s+NOT\s+NULL\s+REFERENCES\s+merchants\(id\)\s+ON\s+DELETE\s+CASCADE/i);
+    expect(table).toMatch(/name\s+VARCHAR\(255\)\s+NOT\s+NULL/i);
+    expect(table).toMatch(/key_prefix\s+VARCHAR\(16\)\s+NOT\s+NULL/i);
+    expect(table).toMatch(/key_hash\s+VARCHAR\(64\)\s+NOT\s+NULL/i);
+    expect(table).toMatch(/environment\s+VARCHAR\(20\)\s+NOT\s+NULL\s+CHECK\s*\(\s*environment\s+IN\s*\('live',\s*'test'\)\s*\)/i);
+    expect(table).toMatch(/last_used_at\s+TIMESTAMP\s+WITH\s+TIME\s+ZONE/i);
+    expect(table).toMatch(/created_at\s+TIMESTAMP\s+WITH\s+TIME\s+ZONE\s+DEFAULT\s+NOW\(\)/i);
+    expect(table).toMatch(/revoked_at\s+TIMESTAMP\s+WITH\s+TIME\s+ZONE/i);
+    expect(table).not.toMatch(/\bsecret\b|raw_key/i);
+    expect(schemaSql).toMatch(/CREATE\s+UNIQUE\s+INDEX\s+\w+\s+ON\s+api_keys\s*\(\s*key_hash\s*\)/i);
+  });
+
+  it('keeps api_keys private to the backend', () => {
+    expect(schemaSql).toMatch(/ALTER\s+TABLE\s+api_keys\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY;/i);
+    expect(schemaSql).not.toMatch(/CREATE\s+POLICY\s+.*ON\s+api_keys\b/i);
+  });
 });
