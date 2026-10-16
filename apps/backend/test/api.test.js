@@ -24,6 +24,8 @@ describe('Merchant API Route Validation & Responses', () => {
         error: null,
       }),
       update: vi.fn().mockReturnThis(),
+      // Billing lock RPCs: acquire/release always succeed unless a test overrides them
+      rpc: vi.fn().mockResolvedValue({ data: true, error: null }),
     };
 
     app.locals.supabase = mockSupabase;
