@@ -20,6 +20,9 @@ Copy `apps/backend/.env.example` to `apps/backend/.env` and configure:
 | `SUPABASE_URL` | Supabase project URL | `https://xyzcompany.supabase.co` |
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase service role secret key | `eyJhbGciOi...` |
 | `ORBIT_CONTRACT_ID` | Deployed Orbit Soroban smart contract ID | `CAZBZBUWBSQYK2RZ6WHMXVDLIQHSU5WD7ANZYL6HLNSCRUOTNYCDYQNG` |
+| `IDEMPOTENCY_KEY_TTL_SECONDS` | How long an `Idempotency-Key` replays its stored response (defaults to 24h) | `86400` |
+| `IDEMPOTENCY_IN_PROGRESS_TIMEOUT_SECONDS` | After this long an unfinished claim is treated as abandoned and may be retried (defaults to 300) | `300` |
+| `PREPARE_LOCK_TTL_SECONDS` | Billing lease held while `/trigger-pull` simulates a pull (defaults to 60) | `60` |
 
 ### Running the API
 
@@ -364,23 +367,63 @@ Status: `201 Created`
   }
   ```
 
-- `500 Internal Server Error`
-  Returned if the database query fails or the customer is already subscribed to the plan (unique constraint violation on `(plan_id, customer_wallet_address)`).
+- `409 Conflict`
+  Returned if the customer is already subscribed to the plan (unique constraint on `(plan_id, customer_wallet_address)`).
   ```json
   {
-    "error": "duplicate key value violates unique constraint \"subscriptions_plan_id_customer_wallet_address_key\""
+    "error": "This wallet is already subscribed to this plan"
   }
   ```
+
+- `500 Internal Server Error`
+  Returned if the database query fails.
+
+---
+
+## Idempotency and Concurrency
+
+### Idempotency-Key header
+
+`POST /plans`, `POST /subscriptions`, `POST /trigger-pull` and `POST /submit-pull` accept an optional `Idempotency-Key` header (1–255 characters, e.g. a UUID v4), following the same conventions as Stripe. Send a fresh key per logical operation and reuse it verbatim when retrying after a timeout or network error.
+
+Keys are scoped to the merchant that owns the resource (the `merchant_id` of the plan, or of the subscription's plan) and are stored in the `idempotency_keys` table for 24 hours.
+
+| Situation | Response |
+|---|---|
+| First request with a key | Executed normally; the response is stored |
+| Retry after it completed | The stored status code and body are replayed with header `Idempotent-Replayed: true`; nothing is re-executed |
+| Retry while the first request is still running | `409 Conflict` with `Retry-After` |
+| Same key, different endpoint or request body | `422 Unprocessable Entity` |
+| First attempt ended in a `5xx` or a transient `409` (billing lock busy) | The key is marked `failed` and the next retry with the same body executes again |
+| Header empty or longer than 255 characters | `400 Bad Request` |
+
+The request body is hashed with SHA-256 after sorting object keys, so key order does not matter. Claiming a key is a single atomic statement (`claim_idempotency_key`), so concurrent duplicates cannot both execute. An attempt whose process died mid-request is recoverable after `IDEMPOTENCY_IN_PROGRESS_TIMEOUT_SECONDS`.
+
+### Per-subscription billing lock
+
+Independently of idempotency keys, `/trigger-pull` and `/submit-pull` take a lease on the subscription in the `billing_locks` table (`acquire_billing_lock` / `release_billing_lock`). A second billing operation on the same subscription while the lease is held gets `409 Conflict` with `Retry-After` and never reaches Soroban simulation or submission. Leases expire automatically (60s for preparation, the confirmation poll timeout plus 60s for submission), so a crashed process cannot block billing permanently. When `/submit-pull` returns `202` (transaction submitted but unconfirmed), the lease is deliberately kept until it expires so no second pull can race the one still in flight.
+
+### Housekeeping
+
+`purge_expired_idempotency_keys()` deletes expired keys and stale leases. Schedule it with `pg_cron`, for example:
+
+```sql
+SELECT cron.schedule('purge-idempotency', '0 * * * *', 'SELECT purge_expired_idempotency_keys()');
+```
 
 ---
 
 ## Database Schema Reference
 
-The API queries three primary tables defined in `apps/backend/schema.sql`:
+The API queries the tables defined in `apps/backend/schema.sql`:
 
 - `merchants`: `id` (UUID PK), `wallet_address` (VARCHAR UNIQUE), `name` (VARCHAR), `created_at` (TIMESTAMP).
 - `plans`: `id` (UUID PK), `merchant_id` (UUID FK -> `merchants.id`), `name` (VARCHAR), `usdc_amount` (NUMERIC), `interval_seconds` (BIGINT), `created_at` (TIMESTAMP).
 - `subscriptions`: `id` (UUID PK), `plan_id` (UUID FK -> `plans.id`), `customer_wallet_address` (VARCHAR), `status` (VARCHAR DEFAULT 'active'), `next_billing_date` (TIMESTAMP), `created_at` (TIMESTAMP).
+- `idempotency_keys`: `id` (UUID PK), `key` (VARCHAR), `merchant_id` (UUID FK -> `merchants.id`, cascade), `request_path` (VARCHAR), `request_hash` (VARCHAR(64)), `status` (`in_progress` / `completed` / `failed`), `response_code` (INTEGER), `response_body` (JSONB), `created_at`, `updated_at`, `expires_at` (TIMESTAMP). Unique on `(merchant_id, key)`.
+- `billing_locks`: `subscription_id` (UUID PK, FK -> `subscriptions.id`), `lock_token` (UUID), `locked_until` (TIMESTAMP), `created_at` (TIMESTAMP).
+
+Existing databases can apply the new section of `schema.sql` (tables 4 and 5, their functions, `REVOKE`s and RLS statements) as a migration.
 
 ### Row Level Security (RLS) Policy Model
 
@@ -389,7 +432,7 @@ Row Level Security is enabled on all tables in `schema.sql` with a locked-down p
 1. **Backend Service Role**: The backend Express API connects with `SUPABASE_SERVICE_ROLE_KEY`. The Postgres service role possesses the `BYPASSRLS` privilege, granting the backend full authority to execute queries, create plans, record subscriptions, and advance billing schedules.
 2. **Public Anon Access (Checkout Flow)**: Direct access via the public Supabase anon key is restricted to `SELECT` on `plans` and `merchants`. This allows unauthenticated checkout widgets and client browsers to inspect plan details and the merchant's recipient address.
 3. **No Public Mutations**: Open `INSERT` and `UPDATE` policies have been removed from all tables. Clients cannot directly inject plans, alter subscriptions, or create unauthorized merchant accounts with the anon key.
-4. **Subscription Confidentiality**: The `subscriptions` table has **no** policies granted to public/anon roles. Postgres default-deny prevents unauthenticated or client-side anon requests from querying subscriber lists or viewing competitor customer accounts.
+4. **Subscription Confidentiality**: The `subscriptions`, `idempotency_keys` and `billing_locks` tables have **no** policies granted to public/anon roles. Postgres default-deny prevents unauthenticated or client-side anon requests from querying subscriber lists or viewing competitor customer accounts.
 
 ---
 
@@ -398,7 +441,7 @@ Row Level Security is enabled on all tables in `schema.sql` with a locked-down p
 - All JSON responses return UTF-8 encoded text.
 - Successful mutations return `201 Created` with a `message` and entity payload (`plan`, `subscription`).
 - Successful queries return `200 OK` with an entity or collection payload (`plan`, `subscribers`).
-- Errors return an appropriate HTTP status code (`400`, `401`, `404`, `500`) with a JSON payload of shape:
+- Errors return an appropriate HTTP status code (`400`, `401`, `404`, `409`, `422`, `500`) with a JSON payload of shape:
   ```json
   {
     "error": "Error description message"

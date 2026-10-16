@@ -35,4 +35,22 @@ describe('Database Schema & Row Level Security (RLS) Policies', () => {
     expect(schemaSql).toMatch(/CREATE\s+POLICY[\s\S]*?ON\s+merchants\s+FOR\s+SELECT/i);
     expect(schemaSql).toMatch(/CREATE\s+POLICY[\s\S]*?ON\s+plans\s+FOR\s+SELECT/i);
   });
+
+  it('defines merchant-scoped idempotency keys with a TTL', () => {
+    const table = schemaSql.match(/CREATE\s+TABLE\s+idempotency_keys\s*\(([\s\S]*?)\n\);/i)?.[1];
+    expect(table).toBeDefined();
+    expect(table).toMatch(/merchant_id\s+UUID\s+NOT\s+NULL\s+REFERENCES\s+merchants\(id\)\s+ON\s+DELETE\s+CASCADE/i);
+    expect(table).toMatch(/request_hash\s+VARCHAR\(64\)\s+NOT\s+NULL/i);
+    expect(table).toMatch(/expires_at\s+TIMESTAMP\s+WITH\s+TIME\s+ZONE\s+NOT\s+NULL/i);
+    expect(table).toMatch(/UNIQUE\s*\(\s*merchant_id\s*,\s*key\s*\)/i);
+  });
+
+  it('keeps idempotency and lock tables private to the backend', () => {
+    expect(schemaSql).toMatch(/ALTER\s+TABLE\s+idempotency_keys\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY;/i);
+    expect(schemaSql).toMatch(/ALTER\s+TABLE\s+billing_locks\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY;/i);
+    expect(schemaSql).not.toMatch(/CREATE\s+POLICY\s+.*ON\s+(idempotency_keys|billing_locks)\b/i);
+    for (const fn of ['claim_idempotency_key', 'acquire_billing_lock', 'release_billing_lock']) {
+      expect(schemaSql).toMatch(new RegExp(`REVOKE\\s+EXECUTE\\s+ON\\s+FUNCTION\\s+${fn}\\(`, 'i'));
+    }
+  });
 });

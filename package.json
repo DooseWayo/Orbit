@@ -3,11 +3,11 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "npm --prefix apps/frontend run dev",
-    "build": "npm --prefix apps/frontend run build",
-    "start": "npm --prefix apps/frontend run start",
+    "dev": "node init && npm --prefix apps/frontend run dev",
+    "build": "node init && npm --prefix apps/frontend run build",
+    "start": "node init && npm --prefix apps/frontend run start",
     "typecheck": "npm --prefix apps/frontend run typecheck",
-    "dev:frontend": "npm --prefix apps/frontend run dev",
-    "dev:backend": "node apps/backend/index.js"
+    "dev:frontend": "node init && npm --prefix apps/frontend run dev",
+    "dev:backend": "node init && node apps/backend/index.js"
   }
 }
