@@ -1,0 +1,18 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "feat/api-key-auth-and-rate-limiting",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "feat/api-key-auth-and-rate-limiting": "main",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "feat/api-key-auth-and-rate-limiting",
+    "origin"
+  ]
+}

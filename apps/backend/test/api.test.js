@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import request from 'supertest';
 import { Keypair, StrKey, Account, Networks, TransactionBuilder } from '@stellar/stellar-sdk';
 import app from '../index.js';
+import { makeApiKey } from './helpers.js';
 
 describe('Merchant API Route Validation & Responses', () => {
   const validMerchantId = '7f8b9a10-b2c3-4d5e-a6f7-112233445566';
@@ -11,6 +12,7 @@ describe('Merchant API Route Validation & Responses', () => {
   const validStellarAddress = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
 
   let mockSupabase;
+  let apiKey;
 
   beforeEach(() => {
     // Create chainable mock Supabase client
@@ -28,7 +30,13 @@ describe('Merchant API Route Validation & Responses', () => {
       rpc: vi.fn().mockResolvedValue({ data: true, error: null }),
     };
 
+    apiKey = makeApiKey({ merchantId: validMerchantId, walletAddress: validStellarAddress });
+    // API key lookup performed by the auth middleware
+    mockSupabase.maybeSingle = vi.fn().mockResolvedValue({ data: apiKey.row, error: null });
+
     app.locals.supabase = mockSupabase;
+    app.locals.rateLimiters.ip.reset();
+    app.locals.rateLimiters.apiKey.reset();
   });
 
   // ==========================================
@@ -38,6 +46,7 @@ describe('Merchant API Route Validation & Responses', () => {
     it('creates a plan successfully with valid data', async () => {
       const res = await request(app)
         .post('/plans')
+        .set('Authorization', apiKey.header)
         .send({
           merchant_id: validMerchantId,
           name: 'Pro Plan',
@@ -53,17 +62,46 @@ describe('Merchant API Route Validation & Responses', () => {
     it('rejects missing fields with 400 and explicit field name', async () => {
       const res = await request(app)
         .post('/plans')
+        .set('Authorization', apiKey.header)
         .send({
           name: 'Pro Plan',
         });
 
       expect(res.status).toBe(400);
-      expect(res.body.error).toContain('merchant_id');
+      expect(res.body.error).toContain('usdc_amount');
+    });
+
+    it('scopes the plan to the authenticated merchant when merchant_id is omitted', async () => {
+      const res = await request(app)
+        .post('/plans')
+        .set('Authorization', apiKey.header)
+        .send({ name: 'Pro Plan', usdc_amount: 290000000, interval_seconds: 2592000 });
+
+      expect(res.status).toBe(201);
+      expect(mockSupabase.insert).toHaveBeenCalledWith([
+        expect.objectContaining({ merchant_id: validMerchantId }),
+      ]);
+    });
+
+    it("rejects a merchant_id belonging to another merchant with 403", async () => {
+      const res = await request(app)
+        .post('/plans')
+        .set('Authorization', apiKey.header)
+        .send({
+          merchant_id: '00000000-0000-4000-8000-000000000000',
+          name: 'Pro Plan',
+          usdc_amount: 290000000,
+          interval_seconds: 2592000,
+        });
+
+      expect(res.status).toBe(403);
+      expect(mockSupabase.insert).not.toHaveBeenCalled();
     });
 
     it('rejects invalid merchant_id UUID with 400', async () => {
       const res = await request(app)
         .post('/plans')
+        .set('Authorization', apiKey.header)
         .send({
           merchant_id: 'not-a-valid-uuid',
           name: 'Pro Plan',
@@ -78,6 +116,7 @@ describe('Merchant API Route Validation & Responses', () => {
     it('rejects negative or zero usdc_amount with 400', async () => {
       const res = await request(app)
         .post('/plans')
+        .set('Authorization', apiKey.header)
         .send({
           merchant_id: validMerchantId,
           name: 'Pro Plan',
@@ -92,6 +131,7 @@ describe('Merchant API Route Validation & Responses', () => {
     it('rejects a non-integer usdc_amount with 400', async () => {
       const res = await request(app)
         .post('/plans')
+        .set('Authorization', apiKey.header)
         .send({
           merchant_id: validMerchantId,
           name: 'Pro Plan',
@@ -106,6 +146,7 @@ describe('Merchant API Route Validation & Responses', () => {
     it('rejects non-positive interval_seconds with 400', async () => {
       const res = await request(app)
         .post('/plans')
+        .set('Authorization', apiKey.header)
         .send({
           merchant_id: validMerchantId,
           name: 'Pro Plan',
@@ -183,26 +224,38 @@ describe('Merchant API Route Validation & Responses', () => {
   // ==========================================
   describe('GET /subscribers', () => {
     it('returns subscribers list for valid merchant_id query param', async () => {
-      mockSupabase.eq.mockResolvedValueOnce({
+      mockSupabase.eq.mockReturnValueOnce(mockSupabase).mockResolvedValueOnce({
         data: [{ id: 'sub-1', customer_wallet_address: validStellarAddress }],
         error: null,
       });
 
-      const res = await request(app).get(`/subscribers?merchant_id=${validMerchantId}`);
+      const res = await request(app).get(`/subscribers?merchant_id=${validMerchantId}`).set('Authorization', apiKey.header);
 
       expect(res.status).toBe(200);
       expect(res.body.subscribers).toHaveLength(1);
     });
 
-    it('returns 400 when merchant_id query param is missing', async () => {
-      const res = await request(app).get('/subscribers');
+    it('scopes the query to the authenticated merchant when merchant_id is omitted', async () => {
+      // First eq() is the API key lookup, second is the subscribers query
+      mockSupabase.eq.mockReturnValueOnce(mockSupabase).mockResolvedValueOnce({ data: [], error: null });
 
-      expect(res.status).toBe(400);
-      expect(res.body.error).toContain('merchant_id');
+      const res = await request(app).get('/subscribers').set('Authorization', apiKey.header);
+
+      expect(res.status).toBe(200);
+      expect(mockSupabase.eq).toHaveBeenCalledWith('plans.merchant_id', validMerchantId);
+    });
+
+    it("returns 403 when merchant_id names another merchant", async () => {
+      const res = await request(app)
+        .get('/subscribers?merchant_id=00000000-0000-4000-8000-000000000000')
+        .set('Authorization', apiKey.header);
+
+      expect(res.status).toBe(403);
+      expect(mockSupabase.eq).not.toHaveBeenCalledWith('plans.merchant_id', expect.anything());
     });
 
     it('returns 400 when merchant_id is an invalid UUID', async () => {
-      const res = await request(app).get('/subscribers?merchant_id=abc');
+      const res = await request(app).get('/subscribers?merchant_id=abc').set('Authorization', apiKey.header);
 
       expect(res.status).toBe(400);
       expect(res.body.error).toContain('merchant_id');
@@ -278,7 +331,7 @@ describe('Merchant API Route Validation & Responses', () => {
   // ==========================================
   describe('POST /trigger-pull', () => {
     it('returns 400 when subscription_id is missing', async () => {
-      const res = await request(app).post('/trigger-pull').send({});
+      const res = await request(app).post('/trigger-pull').set('Authorization', apiKey.header).send({});
 
       expect(res.status).toBe(400);
       expect(res.body.error).toContain('subscription_id');
@@ -287,6 +340,7 @@ describe('Merchant API Route Validation & Responses', () => {
     it('rejects merchant secrets instead of accepting or storing them', async () => {
       const res = await request(app)
         .post('/trigger-pull')
+        .set('Authorization', apiKey.header)
         .send({ subscription_id: validSubscriptionId, merchant_secret: 'must-never-leave-the-wallet' });
 
       expect(res.status).toBe(400);
@@ -301,6 +355,26 @@ describe('Merchant API Route Validation & Responses', () => {
 
       const res = await request(app)
         .post('/trigger-pull')
+        .set('Authorization', apiKey.header)
+        .send({ subscription_id: validSubscriptionId });
+
+      expect(res.status).toBe(404);
+      expect(res.body.error).toBe('Subscription not found');
+    });
+
+    it("returns 404 for a subscription owned by another merchant", async () => {
+      mockSupabase.single.mockResolvedValueOnce({
+        data: {
+          id: validSubscriptionId,
+          customer_wallet_address: validStellarAddress,
+          plans: { merchant_id: '00000000-0000-4000-8000-000000000000', usdc_amount: 290000000, interval_seconds: 2592000 },
+        },
+        error: null,
+      });
+
+      const res = await request(app)
+        .post('/trigger-pull')
+        .set('Authorization', apiKey.header)
         .send({ subscription_id: validSubscriptionId });
 
       expect(res.status).toBe(404);
@@ -317,23 +391,16 @@ describe('Merchant API Route Validation & Responses', () => {
         app.locals.txPollIntervalMs = 1;
         app.locals.txPollTimeoutMs = 20;
 
-        mockSupabase.single.mockImplementation(() => {
-          // First call resolves the subscription, second call resolves the merchant
-          if (mockSupabase.single.mock.calls.length % 2 === 1) {
-            return Promise.resolve({
-              data: {
-                id: validSubscriptionId,
-                customer_wallet_address: validStellarAddress,
-                plans: { merchant_id: validMerchantId, usdc_amount: 290000000, interval_seconds: 2592000 },
-              },
-              error: null,
-            });
-          }
-          return Promise.resolve({
-            data: { wallet_address: merchantKeypair.publicKey() },
-            error: null,
-          });
+        mockSupabase.single.mockResolvedValue({
+          data: {
+            id: validSubscriptionId,
+            customer_wallet_address: validStellarAddress,
+            plans: { merchant_id: validMerchantId, usdc_amount: 290000000, interval_seconds: 2592000 },
+          },
+          error: null,
         });
+        // The merchant wallet comes from the authenticated API key
+        apiKey.row.merchants.wallet_address = merchantKeypair.publicKey();
 
         mockServer = {
           getAccount: vi.fn().mockResolvedValue(new Account(merchantKeypair.publicKey(), '1')),
@@ -353,7 +420,7 @@ describe('Merchant API Route Validation & Responses', () => {
       });
 
       const prepareAndSign = async () => {
-        const prepared = await request(app).post('/trigger-pull').send({ subscription_id: validSubscriptionId });
+        const prepared = await request(app).post('/trigger-pull').set('Authorization', apiKey.header).send({ subscription_id: validSubscriptionId });
         expect(prepared.status).toBe(200);
         expect(mockServer.sendTransaction).not.toHaveBeenCalled();
         const transaction = TransactionBuilder.fromXDR(prepared.body.transaction_xdr, Networks.TESTNET);
@@ -366,6 +433,7 @@ describe('Merchant API Route Validation & Responses', () => {
         const signed_xdr = await prepareAndSign();
         const res = await request(app)
           .post('/submit-pull')
+          .set('Authorization', apiKey.header)
           .send({ subscription_id: validSubscriptionId, signed_xdr });
 
         expect(res.status).toBe(200);
@@ -380,6 +448,7 @@ describe('Merchant API Route Validation & Responses', () => {
         const signed_xdr = await prepareAndSign();
         const res = await request(app)
           .post('/submit-pull')
+          .set('Authorization', apiKey.header)
           .send({ subscription_id: validSubscriptionId, signed_xdr });
 
         expect(res.status).toBe(502);
@@ -392,6 +461,7 @@ describe('Merchant API Route Validation & Responses', () => {
         const signed_xdr = await prepareAndSign();
         const res = await request(app)
           .post('/submit-pull')
+          .set('Authorization', apiKey.header)
           .send({ subscription_id: validSubscriptionId, signed_xdr });
 
         expect(res.status).toBe(202);
@@ -400,8 +470,8 @@ describe('Merchant API Route Validation & Responses', () => {
       });
 
       it('refuses an unsigned transaction', async () => {
-        const prepared = await request(app).post('/trigger-pull').send({ subscription_id: validSubscriptionId });
-        const res = await request(app).post('/submit-pull').send({ subscription_id: validSubscriptionId, signed_xdr: prepared.body.transaction_xdr });
+        const prepared = await request(app).post('/trigger-pull').set('Authorization', apiKey.header).send({ subscription_id: validSubscriptionId });
+        const res = await request(app).post('/submit-pull').set('Authorization', apiKey.header).send({ subscription_id: validSubscriptionId, signed_xdr: prepared.body.transaction_xdr });
         expect(res.status).toBe(401);
         expect(mockServer.sendTransaction).not.toHaveBeenCalled();
       });
